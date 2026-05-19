@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import random
 import subprocess
@@ -23,6 +24,25 @@ def r2_client():
     )
 
 
+def safe_filename(name: str, fallback: str = "instrumental.mp3") -> str:
+    name = str(name or "").strip()
+
+    if not name:
+        name = fallback
+
+    name = os.path.basename(name)
+    name = re.sub(r"[^a-zA-Z0-9._-]+", "-", name)
+    name = name.strip(".-_")
+
+    if not name:
+        name = fallback
+
+    if not name.lower().endswith(".mp3"):
+        name += ".mp3"
+
+    return name
+
+
 def upload_to_r2(local_path: str, key: str, content_type: str):
     bucket = os.environ["R2_BUCKET"]
     s3 = r2_client()
@@ -37,7 +57,11 @@ def upload_to_r2(local_path: str, key: str, content_type: str):
     public_base = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
     url = f"{public_base}/{key}" if public_base else None
 
-    return {"bucket": bucket, "key": key, "url": url}
+    return {
+        "bucket": bucket,
+        "key": key,
+        "url": url,
+    }
 
 
 def download_url(url: str, local_path: str):
@@ -117,11 +141,18 @@ def handler(event):
 
         job_id = str(inp.get("job_id") or uuid.uuid4())
         model = str(inp.get("model") or "htdemucs")
+
         output_prefix = str(inp.get("output_prefix") or f"demucs/{job_id}").strip("/")
+        output_filename = safe_filename(
+            inp.get("output_filename"),
+            fallback="instrumental.mp3",
+        )
+
         input_ext = str(inp.get("input_ext") or "mp3").lstrip(".").lower()
 
         input_path = f"/tmp/{job_id}.{input_ext}"
         output_dir = f"/tmp/{job_id}_out"
+        instrumental_mp3 = f"/tmp/{job_id}_instrumental.mp3"
 
         download_url(audio_url, input_path)
 
@@ -145,58 +176,34 @@ def handler(event):
 
         stem_name = os.path.splitext(os.path.basename(input_path))[0]
         separated_dir = os.path.join(output_dir, model, stem_name)
-
-        vocals_wav = os.path.join(separated_dir, "vocals.wav")
         instrumental_wav = os.path.join(separated_dir, "no_vocals.wav")
-
-        if not os.path.exists(vocals_wav):
-            raise RuntimeError(f"vocals.wav not found at {vocals_wav}")
 
         if not os.path.exists(instrumental_wav):
             raise RuntimeError(f"no_vocals.wav not found at {instrumental_wav}")
 
-        instrumental_mp3 = f"/tmp/{job_id}_instrumental.mp3"
-        vocals_mp3 = f"/tmp/{job_id}_vocals.mp3"
-
-        instrumental_variation = make_fingerprint_safe_mp3(
+        variation = make_fingerprint_safe_mp3(
             instrumental_wav,
             instrumental_mp3,
         )
 
-        vocals_variation = make_fingerprint_safe_mp3(
-            vocals_wav,
-            vocals_mp3,
-        )
+        instrumental_key = f"{output_prefix}/{output_filename}"
 
-        instrumental_key = f"{output_prefix}/instrumental.mp3"
-        vocals_key = f"{output_prefix}/vocals.mp3"
-
-        instrumental_uploaded = upload_to_r2(
+        uploaded = upload_to_r2(
             instrumental_mp3,
             instrumental_key,
             "audio/mpeg",
         )
 
-        vocals_uploaded = upload_to_r2(
-            vocals_mp3,
-            vocals_key,
-            "audio/mpeg",
-        )
-
         return {
             "status": "ok",
-            "version": "demucs-r2-mp3-v1",
+            "version": "demucs-r2-instrumental-mp3-v2",
             "job_id": job_id,
             "model": model,
             "input_url": audio_url,
-            "instrumental": instrumental_uploaded,
-            "vocals": vocals_uploaded,
-            "instrumental_url": instrumental_uploaded.get("url"),
-            "vocals_url": vocals_uploaded.get("url"),
-            "variation": {
-                "instrumental": instrumental_variation,
-                "vocals": vocals_variation,
-            },
+            "output_filename": output_filename,
+            "instrumental": uploaded,
+            "instrumental_url": uploaded.get("url"),
+            "variation": variation,
         }
 
     except subprocess.CalledProcessError as e:
