@@ -1,3 +1,4 @@
 runpod
 requests
+boto3
 demucs
