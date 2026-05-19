@@ -1,18 +1,13 @@
 import os
 import uuid
+import random
 import subprocess
 import requests
 import runpod
 
 
-# -----------------------------
-# R2 helpers
-# -----------------------------
 def r2_client():
-    try:
-        import boto3
-    except Exception as e:
-        raise RuntimeError(f"boto3 import failed. Add boto3 to requirements.txt. Details: {e}")
+    import boto3
 
     required = ["R2_ENDPOINT", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"]
     missing = [k for k in required if not os.environ.get(k)]
@@ -28,21 +23,21 @@ def r2_client():
     )
 
 
-def upload_to_r2(local_path: str, key: str, content_type: str = "audio/wav"):
+def upload_to_r2(local_path: str, key: str, content_type: str):
     bucket = os.environ["R2_BUCKET"]
     s3 = r2_client()
 
-    extra_args = {"ContentType": content_type}
-    s3.upload_file(local_path, bucket, key, ExtraArgs=extra_args)
+    s3.upload_file(
+        local_path,
+        bucket,
+        key,
+        ExtraArgs={"ContentType": content_type},
+    )
 
     public_base = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
     url = f"{public_base}/{key}" if public_base else None
 
-    return {
-        "bucket": bucket,
-        "key": key,
-        "url": url,
-    }
+    return {"bucket": bucket, "key": key, "url": url}
 
 
 def download_url(url: str, local_path: str):
@@ -53,18 +48,72 @@ def download_url(url: str, local_path: str):
         f.write(r.content)
 
 
-# -----------------------------
-# Main RunPod handler
-# -----------------------------
+def get_duration_seconds(path: str) -> float:
+    p = subprocess.run(
+        [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nw=1:nk=1",
+            path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    try:
+        return float(p.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def make_fingerprint_safe_mp3(input_wav: str, output_mp3: str):
+    intro_delay_ms = random.randint(150, 350)
+    outro_delay_s = round(random.uniform(0.10, 0.30), 2)
+    volume = round(random.uniform(0.99, 1.02), 3)
+
+    original_duration = get_duration_seconds(input_wav)
+    final_duration = original_duration + (intro_delay_ms / 1000.0) + outro_delay_s
+
+    audio_filter = (
+        f"adelay={intro_delay_ms}|{intro_delay_ms},"
+        f"volume={volume},"
+        f"apad=pad_dur={outro_delay_s}"
+    )
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i", input_wav,
+            "-af", audio_filter,
+            "-map_metadata", "-1",
+            "-codec:a", "libmp3lame",
+            "-b:a", "192k",
+            "-t", f"{final_duration:.3f}",
+            output_mp3,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    return {
+        "intro_delay_ms": intro_delay_ms,
+        "outro_delay_seconds": outro_delay_s,
+        "volume": volume,
+        "original_duration_seconds": original_duration,
+        "final_duration_seconds": final_duration,
+    }
+
+
 def handler(event):
     try:
         inp = (event or {}).get("input", {}) or {}
 
         audio_url = inp.get("audio_url")
         if not audio_url:
-            return {
-                "error": "Missing required input: audio_url"
-            }
+            return {"error": "Missing required input: audio_url"}
 
         job_id = str(inp.get("job_id") or uuid.uuid4())
         model = str(inp.get("model") or "htdemucs")
@@ -78,10 +127,15 @@ def handler(event):
 
         subprocess.run(
             [
-                "python", "-m", "demucs",
-                "--two-stems", "vocals",
-                "-n", model,
-                "-o", output_dir,
+                "python",
+                "-m",
+                "demucs",
+                "--two-stems",
+                "vocals",
+                "-n",
+                model,
+                "-o",
+                output_dir,
                 input_path,
             ],
             check=True,
@@ -89,43 +143,70 @@ def handler(event):
             text=True,
         )
 
-        # Demucs uses the input filename without extension as folder name
         stem_name = os.path.splitext(os.path.basename(input_path))[0]
         separated_dir = os.path.join(output_dir, model, stem_name)
 
-        vocals_path = os.path.join(separated_dir, "vocals.wav")
-        instrumental_path = os.path.join(separated_dir, "no_vocals.wav")
+        vocals_wav = os.path.join(separated_dir, "vocals.wav")
+        instrumental_wav = os.path.join(separated_dir, "no_vocals.wav")
 
-        if not os.path.exists(vocals_path):
-            raise RuntimeError(f"vocals.wav not found at {vocals_path}")
+        if not os.path.exists(vocals_wav):
+            raise RuntimeError(f"vocals.wav not found at {vocals_wav}")
 
-        if not os.path.exists(instrumental_path):
-            raise RuntimeError(f"no_vocals.wav not found at {instrumental_path}")
+        if not os.path.exists(instrumental_wav):
+            raise RuntimeError(f"no_vocals.wav not found at {instrumental_wav}")
 
-        vocals_key = f"{output_prefix}/vocals.wav"
-        instrumental_key = f"{output_prefix}/instrumental.wav"
+        instrumental_mp3 = f"/tmp/{job_id}_instrumental.mp3"
+        vocals_mp3 = f"/tmp/{job_id}_vocals.mp3"
 
-        vocals_uploaded = upload_to_r2(vocals_path, vocals_key, "audio/wav")
-        instrumental_uploaded = upload_to_r2(instrumental_path, instrumental_key, "audio/wav")
+        instrumental_variation = make_fingerprint_safe_mp3(
+            instrumental_wav,
+            instrumental_mp3,
+        )
+
+        vocals_variation = make_fingerprint_safe_mp3(
+            vocals_wav,
+            vocals_mp3,
+        )
+
+        instrumental_key = f"{output_prefix}/instrumental.mp3"
+        vocals_key = f"{output_prefix}/vocals.mp3"
+
+        instrumental_uploaded = upload_to_r2(
+            instrumental_mp3,
+            instrumental_key,
+            "audio/mpeg",
+        )
+
+        vocals_uploaded = upload_to_r2(
+            vocals_mp3,
+            vocals_key,
+            "audio/mpeg",
+        )
 
         return {
             "status": "ok",
+            "version": "demucs-r2-mp3-v1",
             "job_id": job_id,
             "model": model,
             "input_url": audio_url,
-            "vocals": vocals_uploaded,
             "instrumental": instrumental_uploaded,
+            "vocals": vocals_uploaded,
             "instrumental_url": instrumental_uploaded.get("url"),
             "vocals_url": vocals_uploaded.get("url"),
+            "variation": {
+                "instrumental": instrumental_variation,
+                "vocals": vocals_variation,
+            },
         }
 
     except subprocess.CalledProcessError as e:
         return {
-            "error": "demucs failed",
+            "error": "subprocess failed",
             "returncode": e.returncode,
             "stdout_tail": (e.stdout or "")[-4000:],
             "stderr_tail": (e.stderr or "")[-4000:],
         }
+
     except Exception as e:
         return {
             "error": "handler exception",
